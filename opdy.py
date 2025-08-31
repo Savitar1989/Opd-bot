@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 # =============== CONFIG ===============
 BOT_TOKEN = "7741178469:AAEXmDVBCDCp6wY0AzPzxpuEzNRcKId86_o"
-WEBAPP_URL = "https://fe5a6b117231.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
+WEBAPP_URL = "https://57619ecbc544.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
 
 logging.basicConfig(
@@ -138,7 +138,19 @@ class DatabaseManager:
         """, (status, partner_id, partner_name, partner_username, estimated_time, status, order_id))
         conn.commit()
         conn.close()
-
+    def get_partner_addresses(self, partner_id: int, status: str) -> List[Dict]:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT restaurant_address
+            FROM orders
+            WHERE delivery_partner_id = ? AND status = ?
+            ORDER BY created_at ASC
+        """, (partner_id, status))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
 
 db = DatabaseManager()
 
@@ -384,7 +396,18 @@ HTML_TEMPLATE = r"""
         ${nav}
         ${timeBtns}
 
-        <button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}</button>
+        <button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}
+    let btnHtml = '';
+    if(order.status==='pending'){
+      btnHtml = `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, 'pending')">🚚 Rendelés elfogadása</button>`;
+    } else if(order.status==='accepted'){
+      btnHtml = `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, 'accepted')">✅ Felvettem</button>`;
+    } else if(order.status==='picked_up'){
+      btnHtml = `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, 'picked_up')">✅ Kiszállítva / Leadva</button>`;
+    }
+    // delivered → üres
+
+</button>
       </div>
     `;
   }
@@ -417,8 +440,13 @@ HTML_TEMPLATE = r"""
       if(TAB === 'available'){
         // minden pending
         const r = await fetch(`${API}/api/orders_by_status?status=pending`);
-        data = await r.json();
-      }else{
+        const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) {
+        const txt = await r.text();
+    throw new Error('Nem JSON válasz az /api/... végponttól: ' + txt.slice(0,120));
+    }
+        const data = await r.json();      }
+    else{
         // csak saját rendelések az adott státuszban
         const r = await fetch(`${API}/api/my_orders`, {
           method:'POST', headers:{'Content-Type':'application/json'},
@@ -484,19 +512,32 @@ HTML_TEMPLATE = r"""
     }
   }
 
-  async function openOptimizedRoute(){
-    try{
-      const r = await fetch(`${API}/api/opt_route`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ initData: tg?.initData })
-      });
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || 'Nem sikerült útvonalat készíteni.');
-      window.open(j.url, '_blank');
-    }catch(e){
-      err(e.message || 'Hiba');
+    async function openOptimizedRoute(){
+      try{
+        const r = await fetch(`${API}/api/opt_route`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ initData: tg?.initData })
+        });
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || 'Nem sikerült útvonalat készíteni.');
+
+        const webUrl = j.url; 
+        const deepUrl = webUrl.replace("https://www.google.com/maps/dir", "comgooglemaps://dir");
+
+        if(/Android|iPhone|iPad/i.test(navigator.userAgent)){
+          // Mobil → próbálja a Google Maps appot
+          window.location.href = deepUrl;
+          // Biztonsági fallback: ha nem nyílik meg, nyissa a webes változatot
+          setTimeout(()=>{ window.open(webUrl, "_blank"); }, 1200);
+        } else {
+          // PC → sima webes link
+          window.open(webUrl, "_blank");
+        }
+      }catch(e){
+        err(e.message || 'Hiba');
+      }
     }
-  }
+
 
   function setTab(t){
     TAB = t;
@@ -709,10 +750,6 @@ def api_my_orders():
 
 @app.route("/api/opt_route", methods=["POST"])
 def api_opt_route():
-    """
-    Összes 'picked_up' cím a futárhoz -> Google Maps többmegállós link optimize:true-val.
-    Body: { initData: <tg.initData> }
-    """
     try:
         data = request.json or {}
         user = validate_telegram_data(data.get("initData",""))
@@ -725,14 +762,24 @@ def api_opt_route():
             return jsonify({"ok": False, "error": "no_addresses"})
 
         import urllib.parse
-        enc = lambda s: urllib.parse.quote(s, safe="")
-        dest = enc(addrs[-1])
-        wps = "|".join([enc(a) for a in addrs])
-        url = f"https://www.google.com/maps/dir/?api=1&origin=My+Location&destination={dest}&waypoints=optimize:true|{wps}&travelmode=driving"
+        enc = lambda s: urllib.parse.quote_plus(
+            s.split('. ', 1)[-1] if s and s[0].isdigit() else s.strip(),
+            safe=""
+        )
+
+        if len(addrs) == 1:
+            dest = urllib.parse.quote_plus(addrs[0])
+            url = f"https://www.google.com/maps/dir/My+Location/{dest}/"
+        else:
+            all_points = [urllib.parse.quote_plus(addr) for addr in addrs]
+            joined = "/".join(all_points)
+            url = f"https://www.google.com/maps/dir/My+Location/{joined}/"
+
         return jsonify({"ok": True, "url": url, "count": len(addrs)})
     except Exception as e:
         logger.error(f"api_opt_route error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 # =============== Indítás ===============

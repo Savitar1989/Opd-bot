@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import json
 import threading
+import re
 from queue import Queue, Empty
 from typing import Dict, List, Optional
 
@@ -15,7 +16,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 # =============== CONFIG ===============
 BOT_TOKEN = "7741178469:AAEXmDVBCDCp6wY0AzPzxpuEzNRcKId86_o"
-WEBAPP_URL = "https://364bcc6f4c74.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
+WEBAPP_URL = "https://b77078961319.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
 
 logging.basicConfig(
@@ -285,6 +286,119 @@ class RestaurantBot:
 
 # =============== Flask WebApp ===============
 app = Flask(__name__)
+from flask import render_template_string
+
+ADMIN_HTML = """
+<!doctype html>
+<html lang="hu">
+<head><meta charset="utf-8"><title>Admin</title></head>
+<body>
+  <h1>Admin statisztika</h1>
+  <h2>Heti futár bontás</h2>
+  <table border="1">
+    <tr><th>Hét</th><th>Futár</th><th>Darab</th><th>Átlag idő (perc)</th></tr>
+    {% for r in weekly_courier %}
+    <tr>
+      <td>{{ r.week }}</td>
+      <td>{{ r.courier_name or r.delivery_partner_id }}</td>
+      <td>{{ r.cnt }}</td>
+      <td>{{ r.avg_min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Étterem bontás</h2>
+  <table border="1">
+    <tr><th>Hét</th><th>Csoport</th><th>Darab</th><th>Átlag idő</th></tr>
+    {% for r in weekly_restaurant %}
+    <tr>
+      <td>{{ r.week }}</td>
+      <td>{{ r.group_name }}</td>
+      <td>{{ r.cnt }}</td>
+      <td>{{ r.avg_min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Részletes kézbesítések</h2>
+  <table border="1">
+    <tr><th>Dátum</th><th>Futár</th><th>Csoport</th><th>Cím</th><th>Idő (perc)</th></tr>
+    {% for r in deliveries %}
+    <tr>
+      <td>{{ r.delivered_at }}</td>
+      <td>{{ r.courier_name or r.delivery_partner_id }}</td>
+      <td>{{ r.group_name }}</td>
+      <td>{{ r.restaurant_address }}</td>
+      <td>{{ r.min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
+"""
+
+@app.route("/admin")
+def admin_page():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # Heti futár statisztika
+        cur.execute("""
+            SELECT
+              strftime('%Y-%W', delivered_at) AS week,
+              delivery_partner_id,
+              COALESCE(delivery_partner_name, '') AS courier_name,
+              COUNT(*) AS cnt,
+              ROUND(AVG((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60), 1) AS avg_min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            GROUP BY delivery_partner_id, week
+            ORDER BY week DESC, cnt DESC
+        """)
+        weekly_courier = [dict(r) for r in cur.fetchall()]
+
+        # Heti étterem statisztika
+        cur.execute("""
+            SELECT
+              strftime('%Y-%W', delivered_at) AS week,
+              group_name,
+              COUNT(*) AS cnt,
+              ROUND(AVG((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60), 1) AS avg_min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            GROUP BY group_name, week
+            ORDER BY week DESC, cnt DESC
+        """)
+        weekly_restaurant = [dict(r) for r in cur.fetchall()]
+
+        # Részletes lista
+        cur.execute("""
+            SELECT
+              delivered_at,
+              delivery_partner_id,
+              COALESCE(delivery_partner_name, '') AS courier_name,
+              group_name,
+              restaurant_address,
+              ROUND((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60, 1) AS min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            ORDER BY delivered_at DESC
+            LIMIT 500
+        """)
+        deliveries = [dict(r) for r in cur.fetchall()]
+
+        conn.close()
+        return render_template_string(ADMIN_HTML,
+                                      weekly_courier=weekly_courier,
+                                      weekly_restaurant=weekly_restaurant,
+                                      deliveries=deliveries)
+    except Exception as e:
+        logger.error(f"admin_page error: {e}")
+        return "admin error", 500
+
+
 CORS(app)
 
 def validate_telegram_data(init_data: str) -> Dict | None:
@@ -769,9 +883,13 @@ def api_opt_route():
         if not addrs:
             return jsonify({"ok": False, "error": "no_addresses"})
 
-        import urllib.parse
-        enc = lambda s: urllib.parse.quote(s.split('. ', 1)[-1] if s and s[0].isdigit() else s, safe="")
-        
+        import urllib.parse, re
+        enc = lambda s: urllib.parse.quote_plus(
+            re.sub(r"^(\d+)\.\s*", r"\1 ", s.strip()),  # ha szám+pont az elején → szóközzel javítja
+            safe=""
+        )
+
+        f
         if len(addrs) == 1:
             url = f"https://www.google.com/maps/dir/?api=1&destination={enc(addrs[0])}&travelmode=driving"
         else:
@@ -784,6 +902,7 @@ def api_opt_route():
     except Exception as e:
         logger.error(f"api_opt_route error: {e}")
         return jsonify({"ok": False, "error": "internal_server_error"}), 500
+
 
 # =============== Indítás ===============
 def run_flask():
