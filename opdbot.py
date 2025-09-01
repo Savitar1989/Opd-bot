@@ -1,4 +1,5 @@
 # file: opdy.py
+import asyncio
 import os
 import logging
 import sqlite3
@@ -16,7 +17,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 # =============== CONFIG ===============
 BOT_TOKEN = "7741178469:AAEXmDVBCDCp6wY0AzPzxpuEzNRcKId86_o"
-WEBAPP_URL = "https://b77078961319.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
+WEBAPP_URL = "https://4c80fa80f94c.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
 
 logging.basicConfig(
@@ -179,19 +180,50 @@ class RestaurantBot:
             app.job_queue.run_repeating(self.process_notifications, interval=3)
 
     async def process_notifications(self, context: ContextTypes.DEFAULT_TYPE):
-        while True:
+        processed_count = 0
+        max_per_batch = 5
+
+        while processed_count < max_per_batch:
             try:
                 item = notification_queue.get_nowait()
+                processed_count += 1
             except Empty:
                 break
-            try:
-                await context.bot.send_message(
-                    chat_id=item["chat_id"],
-                    text=item.get("text",""),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Failed to send notification: {e}")
+
+            max_retries = 3
+            for attempt in range (max_retries):
+                try:
+                    await context.bot.send_message(
+                        chat_id=item["chat_id"],
+                        text=item.get("text",""),
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Notifications sent successfully to {item['chat_id']}")
+                    break 
+
+                except Exception as e:
+                    logger.error(f"Failed to send notification (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)  # 1 sec várakozás újrapróbálás előtt
+                    else:
+                        logger.error(f"Final failure sending notification to {item['chat_id']}: {item.get('text', '')[:50]}...")
+
+    def send_notification(self, chat_id: int, text: str):
+        """Értesítés hozzáadása a sorhoz megfelelő formázással"""
+        try:
+            # Ellenőrzi hogy a text nem üres és a chat_id érvényes
+            if not text or not chat_id:
+                logger.warning(f"Invalid notification: chat_id={chat_id}, text='{text[:50] if text else 'None'}'")
+                return
+                
+            notification_queue.put({
+                "chat_id": chat_id, 
+                "text": text
+            })
+            logger.info(f"Notification queued for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Error queuing notification: {e}")
+
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -717,6 +749,8 @@ def api_accept_order():
                 f"📋 **Rendelés ID:** #{order_id}\n"
             )
             notification_queue.put({"chat_id": order["group_id"], "text": text})
+            logger.info(f"Accept notification queued for group {order['group_id']}")
+
         except Exception as e:
             logger.error(f"group notify fail (accept): {e}")
 
@@ -883,20 +917,34 @@ def api_opt_route():
         if not addrs:
             return jsonify({"ok": False, "error": "no_addresses"})
 
-        import urllib.parse, re
-        enc = lambda s: urllib.parse.quote_plus(
-            re.sub(r"^(\d+)\.\s*", r"\1 ", s.strip()),  # ha szám+pont az elején → szóközzel javítja
-            safe=""
-        )
-
-        f
+        import urllib.parse
+        
+        # JAVÍTÁS: Pontosabb URL encoding
+        def clean_encode_address(addr):
+            # Eltávolítja a sorszámot az elejéről ha van (pl. "1. Budapest, ..." -> "Budapest, ...")
+            cleaned = addr.split('. ', 1)[-1] if addr and addr[0].isdigit() else addr
+            return urllib.parse.quote(cleaned, safe="")
+        
         if len(addrs) == 1:
-            url = f"https://www.google.com/maps/dir/?api=1&destination={enc(addrs[0])}&travelmode=driving"
+            # Egy cím esetén egyszerű navigáció
+            url = f"https://www.google.com/maps/dir/?api=1&destination={clean_encode_address(addrs[0])}&travelmode=driving"
+        elif len(addrs) == 2:
+            # Két cím esetén origin és destination
+            url = f"https://www.google.com/maps/dir/?api=1&origin={clean_encode_address(addrs[0])}&destination={clean_encode_address(addrs[1])}&travelmode=driving"
         else:
-            # JAVÍTÁS: optimize:true külön paraméter, nem waypoint része!
-            dest = enc(addrs[-1])
-            wps = "|".join([enc(a) for a in addrs[:-1]])
-            url = f"https://www.google.com/maps/dir/?api=1&origin=My+Location&destination={dest}&waypoints={wps}&waypoints_optimize=true&travelmode=driving"
+            # Több cím esetén waypoints használata
+            # FONTOS: Az első címet origin-ként, az utolsót destination-ként, a többit waypoints-ként használjuk
+            origin = clean_encode_address(addrs[0])
+            destination = clean_encode_address(addrs[-1])
+            # A köztes címek lesznek a waypoints
+            waypoints = [clean_encode_address(addr) for addr in addrs[1:-1]]
+            waypoints_str = "|".join(waypoints)
+            
+            # JAVÍTOTT URL: optimize=true helyett waypoints_optimize=true
+            url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}&waypoints={waypoints_str}&travelmode=driving"
+            
+            # Ha optimalizálást is szeretnénk (de ez nem mindig működik minden címnél)
+            # url += "&waypoints_optimize=true"
             
         return jsonify({"ok": True, "url": url, "count": len(addrs)})
     except Exception as e:
