@@ -1,9 +1,13 @@
 # file: opdy.py
+import asyncio
 import os
 import logging
 import sqlite3
 import json
 import threading
+import re
+import requests
+import urllib.parse
 from queue import Queue, Empty
 from typing import Dict, List, Optional
 
@@ -27,12 +31,58 @@ logger = logging.getLogger(__name__)
 # Értesítések sorban (pl. éttermi csoportnak visszaírás)
 notification_queue: "Queue[Dict]" = Queue()
 
+def improved_address_cleaner(addr: str) -> str:
+    """
+    JAVÍTOTT magyar cím tisztító és kódoló
+    Kezeli: irányítószámokat, kötőjeleket, ékezeteket, komplex formátumokat
+    """
+    if not addr or not addr.strip():
+        return ""
+    
+    # 1. ALAPVETŐ TISZTÍTÁS
+    addr = addr.strip()
+    
+    # 2. SORSZÁM ELTÁVOLÍTÁS JAVÍTVA
+    # "1. Budapest" -> "Budapest", de "1051 Budapest" -> "1051 Budapest"
+    if re.match(r'^\d{1,2}\.\s+', addr):  # Csak 1-2 számjegy + pont + szóköz
+        addr = re.sub(r'^\d{1,2}\.\s+', '', addr)
+    
+    # 3. MAGYAR CÍM NORMALIZÁLÁS
+    # Kerület rövidítések normalizálása
+    addr = re.sub(r'\bV\.\s*ker\.?\s*,?\s*', 'V. kerület, ', addr)
+    addr = re.sub(r'\b(I{1,3}|IV|VI{1,3}|IX|XI{1,3}|XIV|XV{1,3}|XIX|XX{1,3})\.\s*ker\.?\s*,?\s*', 
+                lambda m: m.group(1) + '. kerület, ', addr)
+    
+    # Dupla szóközök eltávolítása  
+    addr = re.sub(r'\s+', ' ', addr).strip()
+    
+    # 4. OKOS ENKÓDOLÁS - NEM túl agresszív
+    # Google/Apple Maps jól kezeli ezeket enkódolás nélkül:
+    safe_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    safe_chars += "áéíóöőúüűÁÉÍÓÖŐÚÜŰ"  # Magyar ékezetes karakterek
+    safe_chars += ".,-"  # Alapvető írásjel
+    
+    # URL enkódolás a safe karakterek megőrzésével
+    return urllib.parse.quote(addr, safe=safe_chars)
 
+def shorten_url(url: str) -> str:
+    """
+    Rövidíti a kapott URL-t TinyURL API-val.
+    Ha nem sikerül, visszaadja az eredeti URL-t.
+    """
+    try:
+        r = requests.get("https://tinyurl.com/api-create.php", params={"url": url}, timeout=5)
+        if r.status_code == 200 and r.text.startswith("http"):
+            return r.text.strip()
+    except Exception as e:
+        logger.error(f"URL rövidítés hiba: {e}")
+        return url
+    
 # =============== DB ===============
 class DatabaseManager:
     def __init__(self) -> None:
         self.init_db()
-
+    
     def init_db(self) -> None:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
@@ -61,6 +111,24 @@ class DatabaseManager:
                 name TEXT NOT NULL
             )
         """)
+        
+        try:
+            cur.execute("PRAGMA table_info(orders)")
+            cols = [r[1] for r in cur.fetchall()]
+
+            if "picked_up_at" not in cols:
+                cur.execute("ALTER TABLE orders ADD COLUMN picked_up_at TIMESTAMP")
+            if "delivered_at" not in cols:
+                cur.execute("ALTER TABLE orders ADD COLUMN delivered_at TIMESTAMP")
+
+            # opcionális, de hasznos indexek:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_delivered_at ON orders(delivered_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_partner ON orders(delivery_partner_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_group ON orders(group_name)")
+            
+        except Exception as e:
+            logger.error(f'DB migrate error: {e}')
+        
         conn.commit()
         conn.close()
         logger.info("Database initialized successfully")
@@ -133,13 +201,21 @@ class DatabaseManager:
                    delivery_partner_name = COALESCE(?, delivery_partner_name),
                    delivery_partner_username = COALESCE(?, delivery_partner_username),
                    estimated_time = COALESCE(?, estimated_time),
-                   accepted_at = CASE WHEN ?='accepted' THEN CURRENT_TIMESTAMP ELSE accepted_at END
+                   accepted_at = CASE WHEN ?='accepted' THEN CURRENT_TIMESTAMP ELSE accepted_at END,
+                   picked_up_at = CASE WHEN ?='picked_up' THEN CURRENT_TIMESTAMP ELSE picked_up_at END,
+                   delivered_at = CASE WHEN ?='delivered' THEN CURRENT_TIMESTAMP ELSE delivered_at END
              WHERE id = ?
-        """, (status, partner_id, partner_name, partner_username, estimated_time, status, order_id))
+        """, (
+            status,
+            partner_id, partner_name, partner_username, estimated_time,
+            status,  # accepted
+            status,  # picked_up
+            status,  # delivered
+            order_id
+        ))
         conn.commit()
         conn.close()
 
-    # HIÁNYZÓ METÓDUS HOZZÁADVA:
     def get_partner_addresses(self, partner_id: int, status: str) -> List[Dict]:
         """Futár adott státuszú rendeléseinek címeit adja vissza."""
         conn = sqlite3.connect(DB_NAME)
@@ -155,9 +231,24 @@ class DatabaseManager:
         conn.close()
         return rows
 
+    def get_partner_order_count(self, partner_id: int, status: str = None) -> int:
+        """Futár rendeléseinek számát adja vissza (opcionálisan státusz szerint szűrve)."""
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        
+        if status:
+            cur.execute("SELECT COUNT(*) FROM orders WHERE delivery_partner_id = ? AND status = ?", 
+                       (partner_id, status))
+        else:
+            cur.execute("SELECT COUNT(*) FROM orders WHERE delivery_partner_id = ?", 
+                       (partner_id,))
+        
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+
 
 db = DatabaseManager()
-
 
 # =============== Telegram Bot ===============
 class RestaurantBot:
@@ -178,19 +269,50 @@ class RestaurantBot:
             app.job_queue.run_repeating(self.process_notifications, interval=3)
 
     async def process_notifications(self, context: ContextTypes.DEFAULT_TYPE):
-        while True:
+        processed_count = 0
+        max_per_batch = 5
+
+        while processed_count < max_per_batch:
             try:
                 item = notification_queue.get_nowait()
+                processed_count += 1
             except Empty:
                 break
-            try:
-                await context.bot.send_message(
-                    chat_id=item["chat_id"],
-                    text=item.get("text",""),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Failed to send notification: {e}")
+
+            max_retries = 3
+            for attempt in range (max_retries):
+                try:
+                    await context.bot.send_message(
+                        chat_id=item["chat_id"],
+                        text=item.get("text",""),
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Notifications sent successfully to {item['chat_id']}")
+                    break 
+
+                except Exception as e:
+                    logger.error(f"Failed to send notification (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)  # 1 sec várakozás újrapróbálás előtt
+                    else:
+                        logger.error(f"Final failure sending notification to {item['chat_id']}: {item.get('text', '')[:50]}...")
+
+    def send_notification(self, chat_id: int, text: str):
+        """Értesítés hozzáadása a sorhoz megfelelő formázással"""
+        try:
+            # Ellenőrzi hogy a text nem üres és a chat_id érvényes
+            if not text or not chat_id:
+                logger.warning(f"Invalid notification: chat_id={chat_id}, text='{text[:50] if text else 'None'}'")
+                return
+                
+            notification_queue.put({
+                "chat_id": chat_id, 
+                "text": text
+            })
+            logger.info(f"Notification queued for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Error queuing notification: {e}")
+
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -285,6 +407,7 @@ class RestaurantBot:
 
 # =============== Flask WebApp ===============
 app = Flask(__name__)
+from flask import render_template_string
 CORS(app)
 
 def validate_telegram_data(init_data: str) -> Dict | None:
@@ -320,16 +443,25 @@ HTML_TEMPLATE = r"""
     .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     .pill{padding:2px 8px;border-radius:999px;background:#eee;font-size:12px}
     .time-buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
-    .time-btn{border:1px solid #1a73e8;border-radius:10px;padding:10px;background:#fff;cursor:pointer}
+    .time-btn{border:1px solid #1a73e8;border-radius:10px;padding:10px;background:#fff;cursor:pointer;font-size:12px}
     .time-btn.selected{background:#1a73e8;color:#fff}
     .accept-btn{border:0;border-radius:10px;padding:12px;width:100%;background:#1a73e8;color:#fff;cursor:pointer}
     .muted{color:#666;font-size:12px}
-    .toolbar{display:flex;gap:8px;margin:8px 0;flex-wrap:wrap}
-    a.nav{display:inline-block;text-decoration:none;border:1px solid #1a73e8;border-radius:10px;padding:10px;background:#fff}
+    
+    /* JAVÍTOTT navigációs gombok */
+    .nav-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:8px 0}
+    .nav{display:block;text-decoration:none;border:1px solid #1a73e8;border-radius:8px;padding:8px;background:#fff;text-align:center;font-size:11px;color:#1a73e8}
+    .nav.apple{border-color:#000;color:#000;background:#f5f5f7}
+    .nav:hover{opacity:0.8}
+    
     .ok{display:none;background:#d4edda;color:#155724;border-radius:8px;padding:10px;margin:8px 0}
     .err{display:none;background:#f8d7da;color:#721c24;border-radius:8px;padding:10px;margin:8px 0}
-    .routebar{display:none;gap:8px;margin:8px 0}
-    .routebtn{border:0;border-radius:10px;padding:10px 12px;background:#1a73e8;color:#fff;cursor:pointer}
+    
+    /* JAVÍTOTT útvonal gombok */
+    .routebar{display:none;gap:6px;margin:8px 0;flex-wrap:wrap}
+    .routebtn{border:0;border-radius:10px;padding:10px 12px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px}
+    .routebtn.apple{background:#000}
+    .routebtn:hover{opacity:0.9}
   </style>
 </head>
 <body>
@@ -343,8 +475,10 @@ HTML_TEMPLATE = r"""
       <button class="tab" id="tab-dv" onclick="setTab('delivered')">Kiszállított</button>
     </div>
 
+    <!-- JAVÍTOTT útvonal gombok Apple Maps támogatással -->
     <div class="routebar" id="routebar">
-      <button class="routebtn" onclick="openOptimizedRoute()">🗺️ Útvonal az ÖSSZES felvett címhez (optimalizált)</button>
+      <button class="routebtn" onclick="openOptimizedRoute('google')">🗺️ Google Maps - Összes cím</button>
+      <button class="routebtn apple" onclick="openOptimizedRoute('apple')">🍎 Apple Maps - Összes cím</button>
     </div>
 
     <div class="ok" id="ok"></div>
@@ -353,28 +487,56 @@ HTML_TEMPLATE = r"""
   </div>
 
 <script>
-  const tg = window.Telegram?.WebApp; tg?.expand();
+  const tg = window.Telegram?.WebApp; 
+  if(tg) tg.expand();
+  
   const API = window.location.origin;
   let selectedETA = {}; // order_id -> 10/20/30
   let TAB = (new URLSearchParams(location.search).get('tab')) || 'available';
 
-  function ok(m){ const d=document.getElementById('ok'); d.textContent=m; d.style.display='block'; setTimeout(()=>d.style.display='none', 3000); }
-  function err(m){ const d=document.getElementById('err'); d.textContent=m; d.style.display='block'; setTimeout(()=>d.style.display='none', 5000); }
-
-  function mapsLink(addr){
-    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addr)}&travelmode=driving`;
+  function ok(m){ 
+    const d=document.getElementById('ok'); 
+    d.textContent=m; 
+    d.style.display='block'; 
+    setTimeout(()=>d.style.display='none', 3000); 
   }
+  
+  function err(m){ 
+    const d=document.getElementById('err'); 
+    d.textContent=m; 
+    d.style.display='block'; 
+    setTimeout(()=>d.style.display='none', 5000); 
+  }
+
+  // JAVÍTOTT navigációs linkek - jelenlegi helyről indul
+  function googleMapsLink(addr){
+    const cleanAddr = addr.replace(/^\d{1,2}\.\s+/, ''); // Sorszám eltávolítás
+    // Mobilon az alkalmazást nyitja, asztali böngészőben webet
+    const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    if (isMobile) {
+        return `https://maps.google.com/?q=${encodeURIComponent(cleanAddr)}`;
+    }
+    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(cleanAddr)}&travelmode=driving`;
+  }
+  
+  function appleMapsLink(addr){
+    return `maps://?daddr=${encodeURIComponent(addr)}`;
+  }
+  
   function wazeLink(addr){
     return `https://waze.com/ul?q=${encodeURIComponent(addr)}&navigate=yes`;
   }
 
   function render(order){
+    // JAVÍTOTT navigációs gombok ráccsal
     const nav = `
-      <div class="toolbar">
-        <a class="nav" href="${mapsLink(order.restaurant_address)}" target="_blank">🗺️ Google Maps</a>
+      <div class="nav-grid">
+        <a class="nav" href="${googleMapsLink(order.restaurant_address)}" target="_blank">🗺️ Google</a>
+        <a class="nav apple" href="${appleMapsLink(order.restaurant_address)}" target="_blank">🍎 Apple</a>
         <a class="nav" href="${wazeLink(order.restaurant_address)}" target="_blank">🚗 Waze</a>
       </div>
     `;
+    
     const timeBtns = `
       <div class="time-buttons" style="${order.status==='pending'?'':'display:none'}">
         <button class="time-btn" data-oid="${order.id}" data-eta="10">⏱️ 10 perc</button>
@@ -382,10 +544,13 @@ HTML_TEMPLATE = r"""
         <button class="time-btn" data-oid="${order.id}" data-eta="30">⏱️ 30 perc</button>
       </div>
     `;
+    
     let btnLabel = '🚚 Rendelés elfogadása';
     if(order.status==='accepted') btnLabel = '✅ Felvettem';
     if(order.status==='picked_up') btnLabel = '✅ Kiszállítva / Leadva';
 
+    const showBtn = order.status !== 'delivered';
+    
     return `
       <div class="card" id="card-${order.id}">
         <div class="row">
@@ -396,11 +561,9 @@ HTML_TEMPLATE = r"""
         ${order.phone_number ? `<div>📞 <b>Telefon:</b> ${order.phone_number}</div>` : ''}
         ${order.order_details ? `<div>📝 <b>Megjegyzés:</b> ${order.order_details}</div>` : ''}
         <div class="muted">ID: #${order.id} • ${order.created_at}</div>
-
         ${nav}
         ${timeBtns}
-
-        <button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}</button>
+        ${showBtn ? `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}</button>` : ''}
       </div>
     `;
   }
@@ -409,7 +572,7 @@ HTML_TEMPLATE = r"""
     document.querySelectorAll('.time-btn').forEach(b=>{
       b.addEventListener('click', ()=>{
         const oid = b.dataset.oid, eta = b.dataset.eta;
-        document.querySelectorAll(`.time-btn[data-oid="${oid}"]`).forEach(x=>x.classList.remove('selected'));
+        document.querySelectorAll(`[data-oid="${oid}"]`).forEach(x=>x.classList.remove('selected'));
         b.classList.add('selected');
         selectedETA[oid] = eta;
         if(tg?.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
@@ -431,25 +594,16 @@ HTML_TEMPLATE = r"""
     let data = [];
     try{
       if(TAB === 'available'){
-        // minden pending
         const r = await fetch(`${API}/api/orders_by_status?status=pending`);
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
-        const contentType = r.headers.get('content-type');
-        if (!contentType || !contentType.includes('application/json')) {
-          throw new Error('A szerver nem JSON formátumot küldött vissza');
-        }
         data = await r.json();
       }else{
-        // csak saját rendelések az adott státuszban
         const r = await fetch(`${API}/api/my_orders`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
+          method:'POST', 
+          headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ initData: tg?.initData || '', status: TAB })
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
-        const contentType = r.headers.get('content-type');
-        if (!contentType || !contentType.includes('application/json')) {
-          throw new Error('A szerver nem JSON formátumot küldött vissza');
-        }
         const j = await r.json();
         if(!j.ok) throw new Error(j.error||'Hálózati hiba');
         data = j.orders || [];
@@ -460,92 +614,170 @@ HTML_TEMPLATE = r"""
       data = [];
     }
 
-    if(!data.length){ list.innerHTML = '<div class="muted">Nincs rendelés.</div>'; return; }
+    if(!data.length){ 
+      list.innerHTML = '<div class="muted">Nincs rendelés.</div>'; 
+      return; 
+    }
+    
     list.innerHTML = data.map(render).join('');
     wireTimeButtons();
   }
 
   async function doAction(orderId, status){
     const btn = document.getElementById(`btn-${orderId}`);
-    btn.disabled = true; const old = btn.textContent; btn.textContent = '⏳...';
+    if(!btn || btn.disabled) return;
+    
+    btn.disabled = true; 
+    const old = btn.textContent; 
+    btn.textContent = '⏳...';
+    
     try{
+      let apiUrl, payload;
+      
       if(status==='pending'){
-        const eta = selectedETA[orderId]; if(!eta) throw new Error('Válassz időt (10/20/30 perc).');
-        const r = await fetch(`${API}/api/accept_order`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ order_id: orderId, estimated_time: eta, initData: tg?.initData || '' })
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
-        const j = await r.json(); if(!j.ok) throw new Error(j.error||'Hiba az elfogadásnál.');
+        const eta = selectedETA[orderId]; 
+        if(!eta) throw new Error('Válassz időt (10/20/30 perc).');
+        apiUrl = `${API}/api/accept_order`;
+        payload = { order_id: orderId, estimated_time: eta, initData: tg?.initData || '' };
+      } else if(status==='accepted'){
+        apiUrl = `${API}/api/pickup_order`;
+        payload = { order_id: orderId, initData: tg?.initData || '' };
+      } else if(status==='picked_up'){
+        apiUrl = `${API}/api/mark_delivered`;
+        payload = { order_id: orderId, initData: tg?.initData || '' };
+      } else {
+        throw new Error('Ismeretlen státusz');
+      }
+      
+      const r = await fetch(apiUrl, {
+        method:'POST', 
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+      const j = await r.json(); 
+      if(!j.ok) throw new Error(j.error||'Szerver hiba');
+      
+      // Sikeres műveletek kezelése
+      if(status==='pending'){
         ok('Elfogadva.');
         btn.textContent = '✅ Felvettem';
-        btn.disabled = false;
         btn.setAttribute('onclick', `doAction(${orderId}, 'accepted')`);
-        const tb = document.querySelector(`#card-${orderId} .time-buttons`); if(tb) tb.style.display='none';
-        const pill = document.querySelector(`#card-${orderId} .pill`); if(pill) pill.textContent='accepted';
+        const tb = document.querySelector(`#card-${orderId} .time-buttons`); 
+        if(tb) tb.style.display='none';
+        const pill = document.querySelector(`#card-${orderId} .pill`); 
+        if(pill) pill.textContent='accepted';
       } else if(status==='accepted'){
-        const r = await fetch(`${API}/api/pickup_order`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ order_id: orderId, initData: tg?.initData || '' })
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
-        const j = await r.json(); if(!j.ok) throw new Error(j.error||'Hiba a felvételnél.');
         ok('Felvéve.');
         btn.textContent = '✅ Kiszállítva / Leadva';
-        btn.disabled = false;
         btn.setAttribute('onclick', `doAction(${orderId}, 'picked_up')`);
-        const pill = document.querySelector(`#card-${orderId} .pill`); if(pill) pill.textContent='picked_up';
+        const pill = document.querySelector(`#card-${orderId} .pill`); 
+        if(pill) pill.textContent='picked_up';
       } else if(status==='picked_up'){
-        const r = await fetch(`${API}/api/mark_delivered`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ order_id: orderId, initData: tg?.initData || '' })
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
-        const j = await r.json(); if(!j.ok) throw new Error(j.error||'Hiba a lezárásnál.');
         ok('Kiszállítva.');
         const card = document.getElementById(`card-${orderId}`);
-        if(card){ card.style.opacity='0.4'; setTimeout(()=>card.remove(), 400); }
+        if(card){ 
+          card.style.opacity='0.4'; 
+          setTimeout(()=>card.remove(), 400); 
+        }
       }
+      
+      btn.disabled = false;
       if(tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+      
     }catch(e){
       console.error('Action error:', e);
-      err(e.message || 'Hiba');
-      btn.disabled = false; btn.textContent = old;
+      err(e.message || 'Hiba a művelet végrehajtásakor');
+      btn.disabled = false; 
+      btn.textContent = old;
       if(tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('error');
     }
   }
 
-    async function openOptimizedRoute(){
-      try{
-        const r = await fetch(`${API}/api/opt_route`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ initData: tg?.initData || '' })
-        });
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || 'Nem sikerült útvonalat készíteni.');
-    
-        // iPhone/Telegram WebApp fix
-        if (tg?.openLink) {
-          tg.openLink(j.url); // Telegram WebApp hivatalos módszer
-        } else {
-          // Fallback PC-re
-          window.open(j.url, '_blank');
-        }
-      }catch(e){
-        console.error('Route error:', e);
-        err(e.message || 'Hiba');
+  // JAVÍTOTT útvonal megnyitás
+  async function openOptimizedRoute(mapType = 'google'){
+    try{
+      const r = await fetch(`${API}/api/opt_route`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ 
+          initData: tg?.initData || '', 
+          mapType: mapType 
+        })
+      });
+      const j = await r.json();
+      if(!j.ok) throw new Error(j.error || 'Nem sikerült útvonalat készíteni.');
+  
+      // iOS/Telegram WebApp fix mindkét térképhez
+      if (tg?.openLink) {
+        tg.openLink(j.url);
+      } else {
+        window.open(j.url, '_blank');
       }
+    }catch(e){
+      console.error('Route error:', e);
+      err(e.message || 'Hiba');
     }
-
-
+  }
+  
   function setTab(t){
     TAB = t;
     load();
   }
 
+  // Kezdeti betöltés és automatikus frissítés
   load();
-  setInterval(load, 30000);
+  setInterval(load, 30000); // 30 másodpercenként frissít
 </script>
+</body>
+</html>
+"""
+
+ADMIN_HTML = """
+<!doctype html>
+<html lang="hu">
+<head><meta charset="utf-8"><title>Admin</title></head>
+<body>
+  <h1>Admin statisztika</h1>
+  <h2>Heti futár bontás</h2>
+  <table border="1">
+    <tr><th>Hét</th><th>Futár</th><th>Darab</th><th>Átlag idő (perc)</th></tr>
+    {% for r in weekly_courier %}
+    <tr>
+      <td>{{ r.week }}</td>
+      <td>{{ r.courier_name or r.delivery_partner_id }}</td>
+      <td>{{ r.cnt }}</td>
+      <td>{{ r.avg_min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Étterem bontás</h2>
+  <table border="1">
+    <tr><th>Hét</th><th>Csoport</th><th>Darab</th><th>Átlag idő</th></tr>
+    {% for r in weekly_restaurant %}
+    <tr>
+      <td>{{ r.week }}</td>
+      <td>{{ r.group_name }}</td>
+      <td>{{ r.cnt }}</td>
+      <td>{{ r.avg_min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Részletes kézbesítések</h2>
+  <table border="1">
+    <tr><th>Dátum</th><th>Futár</th><th>Csoport</th><th>Cím</th><th>Idő (perc)</th></tr>
+    {% for r in deliveries %}
+    <tr>
+      <td>{{ r.delivered_at }}</td>
+      <td>{{ r.courier_name or r.delivery_partner_id }}</td>
+      <td>{{ r.group_name }}</td>
+      <td>{{ r.restaurant_address }}</td>
+      <td>{{ r.min }}</td>
+    </tr>
+    {% endfor %}
+  </table>
 </body>
 </html>
 """
@@ -603,6 +835,8 @@ def api_accept_order():
                 f"📋 **Rendelés ID:** #{order_id}\n"
             )
             notification_queue.put({"chat_id": order["group_id"], "text": text})
+            logger.info(f"Accept notification queued for group {order['group_id']}")
+
         except Exception as e:
             logger.error(f"group notify fail (accept): {e}")
 
@@ -756,34 +990,140 @@ def api_my_orders():
 
 
 @app.route("/api/opt_route", methods=["POST"])
-def api_opt_route():
+def api_opt_route_improved():
     try:
         data = request.json or {}
         user = validate_telegram_data(data.get("initData",""))
         if not user:
             return jsonify({"ok": False, "error":"unauthorized"}), 401
 
+        map_type = data.get("mapType", "google")
+        
         rows = db.get_partner_addresses(partner_id=user["id"], status="picked_up")
         addrs = [r["restaurant_address"] for r in rows if r.get("restaurant_address") and r["restaurant_address"].strip()]
         
         if not addrs:
             return jsonify({"ok": False, "error": "no_addresses"})
 
-        import urllib.parse
-        enc = lambda s: urllib.parse.quote(s.split('. ', 1)[-1] if s and s[0].isdigit() else s, safe="")
+        def clean_encode_address(addr):
+            return improved_address_cleaner(addr)
         
-        if len(addrs) == 1:
-            url = f"https://www.google.com/maps/dir/?api=1&destination={enc(addrs[0])}&travelmode=driving"
+        if map_type == "apple":
+            # Apple Maps
+            if len(addrs) == 1:
+                url = f"maps://?daddr={clean_encode_address(addrs[0])}"
+            else:
+                first_addr = clean_encode_address(addrs[0])
+                last_addr = clean_encode_address(addrs[-1])
+                url = f"maps://?saddr={first_addr}&daddr={last_addr}"
+                
         else:
-            # JAVÍTÁS: optimize:true külön paraméter, nem waypoint része!
-            dest = enc(addrs[-1])
-            wps = "|".join([enc(a) for a in addrs[:-1]])
-            url = f"https://www.google.com/maps/dir/?api=1&origin=My+Location&destination={dest}&waypoints={wps}&waypoints_optimize=true&travelmode=driving"
-            
-        return jsonify({"ok": True, "url": url, "count": len(addrs)})
+            # Google Maps - JAVÍTOTT címkezeléssel
+            if len(addrs) == 1:
+                url = f"https://www.google.com/maps/dir/?api=1&destination={clean_encode_address(addrs[0])}&travelmode=driving"
+                
+            elif len(addrs) == 2:
+                # Két cím: első->második
+                dest = clean_encode_address(addrs[1])
+                waypoint = clean_encode_address(addrs[0])
+                url = f"https://www.google.com/maps/dir/?api=1&destination={dest}&waypoints={waypoint}&travelmode=driving"
+                
+            else:
+                # Több cím (3+)
+                destination = clean_encode_address(addrs[-1])
+                waypoints = [clean_encode_address(addr) for addr in addrs[:-1]]
+                
+                # Google Maps waypoints limit (23)
+                if len(waypoints) > 23:
+                    waypoints = waypoints[:23]
+                    logger.warning(f"Waypoints truncated: {len(addrs)} -> 24 (23 waypoints + destination)")
+                
+                waypoints_str = "|".join(waypoints)
+                url = f"https://www.google.com/maps/dir/?api=1&destination={destination}&waypoints={waypoints_str}&travelmode=driving"
+                # Ha a link nagyon hosszú vagy sok cím van, akkor rövidítünk
+            if len(url) > 1800 or len(addrs) >= 4:
+                short_url = shorten_url(url)
+                final_url = short_url
+            else:
+                final_url = url
+
+            return jsonify({
+                "ok": True,
+                "url": final_url,
+                "count": len(addrs),
+                "mapType": map_type,
+                "addresses_original": addrs,
+                "addresses_cleaned": [clean_encode_address(addr) for addr in addrs]
+            })
+
+        
     except Exception as e:
         logger.error(f"api_opt_route error: {e}")
-        return jsonify({"ok": False, "error": "internal_server_error"}), 500
+        return jsonify({"ok": False, "error": f"internal_server_error: {str(e)}"}), 500
+
+    
+@app.route("/admin")
+def admin_page():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # Heti futár statisztika
+        cur.execute("""
+            SELECT
+              strftime('%Y-%W', delivered_at) AS week,
+              delivery_partner_id,
+              COALESCE(delivery_partner_name, '') AS courier_name,
+              COUNT(*) AS cnt,
+              ROUND(AVG((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60), 1) AS avg_min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            GROUP BY delivery_partner_id, week
+            ORDER BY week DESC, cnt DESC
+        """)
+        weekly_courier = [dict(r) for r in cur.fetchall()]
+
+        # Heti étterem statisztika
+        cur.execute("""
+            SELECT
+              strftime('%Y-%W', delivered_at) AS week,
+              group_name,
+              COUNT(*) AS cnt,
+              ROUND(AVG((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60), 1) AS avg_min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            GROUP BY group_name, week
+            ORDER BY week DESC, cnt DESC
+        """)
+        weekly_restaurant = [dict(r) for r in cur.fetchall()]
+
+        # Részletes lista
+        cur.execute("""
+            SELECT
+              delivered_at,
+              delivery_partner_id,
+              COALESCE(delivery_partner_name, '') AS courier_name,
+              group_name,
+              restaurant_address,
+              ROUND((julianday(delivered_at) - julianday(accepted_at)) * 24 * 60, 1) AS min
+            FROM orders
+            WHERE delivered_at IS NOT NULL AND accepted_at IS NOT NULL
+            ORDER BY delivered_at DESC
+            LIMIT 500
+        """)
+        deliveries = [dict(r) for r in cur.fetchall()]
+
+        conn.close()
+        return render_template_string(ADMIN_HTML,
+                                      weekly_courier=weekly_courier,
+                                      weekly_restaurant=weekly_restaurant,
+                                      deliveries=deliveries)
+    except Exception as e:
+        logger.error(f"admin_page error: {e}")
+        return "admin error", 500
+
+
 
 # =============== Indítás ===============
 def run_flask():
