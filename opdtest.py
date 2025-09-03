@@ -8,8 +8,11 @@ import threading
 import re
 import requests
 import urllib.parse
+import math
+import itertools
+import time
 from queue import Queue, Empty
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, render_template_string, request, jsonify
 from flask_cors import CORS
@@ -19,8 +22,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 # =============== CONFIG ===============
 BOT_TOKEN = "7741178469:AAEXmDVBCDCp6wY0AzPzxpuEzNRcKId86_o"
-WEBAPP_URL = "https://4c80fa80f94c.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
+WEBAPP_URL = "https://a05ef57c06af.ngrok-free.app"  # ha iPad/ngrok: "https://<valami>.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
+# Admin jogosítottak listája (Telegram user ID-k)
+ADMIN_USER_IDS = [7553912440]  # Itt add meg a saját Telegram user ID-d
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,39 +36,169 @@ logger = logging.getLogger(__name__)
 # Értesítések sorban (pl. éttermi csoportnak visszaírás)
 notification_queue: "Queue[Dict]" = Queue()
 
-def improved_address_cleaner(addr: str) -> str:
+def parse_hungarian_address(address: str) -> str:
     """
-    JAVÍTOTT magyar cím tisztító és kódoló
-    Kezeli: irányítószámokat, kötőjeleket, ékezeteket, komplex formátumokat
+    Magyar cím parser - rövidítések és irányítószámok felismerése
     """
-    if not addr or not addr.strip():
+    if not address or not address.strip():
         return ""
     
-    # 1. ALAPVETŐ TISZTÍTÁS
-    addr = addr.strip()
+    addr = address.strip()
     
-    # 2. SORSZÁM ELTÁVOLÍTÁS JAVÍTVA
-    # "1. Budapest" -> "Budapest", de "1051 Budapest" -> "1051 Budapest"
-    if re.match(r'^\d{1,2}\.\s+', addr):  # Csak 1-2 számjegy + pont + szóköz
-        addr = re.sub(r'^\d{1,2}\.\s+', '', addr)
+    # Irányítószám felismerés és normalizálás
+    # "1051 Budapest" -> "1051 Budapest"
+    # "Budapest 1051" -> "1051 Budapest"
+    postal_pattern = r'(\d{4})\s*([A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüű\s]+)'
+    match = re.search(postal_pattern, addr)
+    if match:
+        postal_code, city = match.groups()
+        addr = f"{postal_code} {city.strip()}"
     
-    # 3. MAGYAR CÍM NORMALIZÁLÁS
-    # Kerület rövidítések normalizálása
-    addr = re.sub(r'\bV\.\s*ker\.?\s*,?\s*', 'V. kerület, ', addr)
-    addr = re.sub(r'\b(I{1,3}|IV|VI{1,3}|IX|XI{1,3}|XIV|XV{1,3}|XIX|XX{1,3})\.\s*ker\.?\s*,?\s*', 
-                lambda m: m.group(1) + '. kerület, ', addr)
+    # Magyar rövidítések felismerése és kibővítése
+    abbreviations = {
+        r'\bsgt\b': 'sugárút',
+        r'\bkrt\b': 'körút', 
+        r'\but\b': 'utca',
+        r'\bút\b': 'utca',
+        r'\btér\b': 'tér',
+        r'\bpl\b': 'pályaudvar',
+        r'\báll\b': 'állomás',
+        r'\bker\b': 'kerület',
+        r'\bker\.\b': 'kerület',
+        r'\bV\.\s*ker\b': 'V. kerület',
+        r'\bI\.\s*ker\b': 'I. kerület',
+        r'\bII\.\s*ker\b': 'II. kerület',
+        r'\bIII\.\s*ker\b': 'III. kerület',
+        r'\bIV\.\s*ker\b': 'IV. kerület',
+        r'\bVI\.\s*ker\b': 'VI. kerület',
+        r'\bVII\.\s*ker\b': 'VII. kerület',
+        r'\bVIII\.\s*ker\b': 'VIII. kerület',
+        r'\bIX\.\s*ker\b': 'IX. kerület',
+        r'\bX\.\s*ker\b': 'X. kerület',
+        r'\bXI\.\s*ker\b': 'XI. kerület',
+        r'\bXII\.\s*ker\b': 'XII. kerület',
+        r'\bXIII\.\s*ker\b': 'XIII. kerület',
+        r'\bXIV\.\s*ker\b': 'XIV. kerület',
+        r'\bXV\.\s*ker\b': 'XV. kerület',
+        r'\bXVI\.\s*ker\b': 'XVI. kerület',
+        r'\bXVII\.\s*ker\b': 'XVII. kerület',
+        r'\bXVIII\.\s*ker\b': 'XVIII. kerület',
+        r'\bXIX\.\s*ker\b': 'XIX. kerület',
+        r'\bXX\.\s*ker\b': 'XX. kerület',
+        r'\bXXI\.\s*ker\b': 'XXI. kerület',
+        r'\bXXII\.\s*ker\b': 'XXII. kerület',
+        r'\bXXIII\.\s*ker\b': 'XXIII. kerület'
+    }
     
-    # Dupla szóközök eltávolítása  
+    for pattern, replacement in abbreviations.items():
+        addr = re.sub(pattern, replacement, addr, flags=re.IGNORECASE)
+    
+    # Dupla szóközök eltávolítása
     addr = re.sub(r'\s+', ' ', addr).strip()
     
-    # 4. OKOS ENKÓDOLÁS - NEM túl agresszív
-    # Google/Apple Maps jól kezeli ezeket enkódolás nélkül:
-    safe_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    safe_chars += "áéíóöőúüűÁÉÍÓÖŐÚÜŰ"  # Magyar ékezetes karakterek
-    safe_chars += ".,-"  # Alapvető írásjel
+    return addr
+
+def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+    """
+    Cím geokódolása Nominatim API-val
+    """
+    try:
+        time.sleep(0.5)  # Udvarias várakozás
+        
+        parsed_addr = parse_hungarian_address(address)
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            'q': parsed_addr,
+            'format': 'json',
+            'limit': 1,
+            'countrycodes': 'hu',
+            'addressdetails': 1
+        }
+        headers = {
+            'User-Agent': 'OPDBot/1.0 (Delivery Navigation)'
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data and len(data) > 0:
+                lat = float(data[0]['lat'])
+                lon = float(data[0]['lon'])
+                return (lat, lon)
+    except Exception as e:
+        logger.error(f"Geocoding error for '{address}': {e}")
+    return None
+
+def haversine_distance(coord1: Tuple[float, float], coord2: Tuple[float, float]) -> float:
+    """
+    Haversine formula - légvonalbeli távolság két koordináta között (km-ben)
+    """
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
     
-    # URL enkódolás a safe karakterek megőrzésével
-    return urllib.parse.quote(addr, safe=safe_chars)
+    R = 6371.0  # Föld sugara km-ben
+    
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    return R * c
+
+def optimize_route(addresses: List[str]) -> List[str]:
+    """
+    Egyszerű útvonal optimalizálás - legközelebbi szomszéd algoritmus
+    """
+    if len(addresses) <= 1:
+        return addresses
+    
+    # Maximum 6 cím (teljesítmény miatt)
+    if len(addresses) > 6:
+        logger.warning(f"Too many addresses ({len(addresses)}), limiting to 6")
+        addresses = addresses[:6]
+    
+    # Geokódolás
+    coords = []
+    valid_addresses = []
+    
+    for addr in addresses:
+        coord = geocode_address(addr)
+        if coord:
+            coords.append(coord)
+            valid_addresses.append(addr)
+        else:
+            logger.warning(f"Could not geocode address: {addr}")
+    
+    if len(valid_addresses) <= 1:
+        return valid_addresses
+    
+    # Legközelebbi szomszéd algoritmus
+    optimized = [valid_addresses[0]]  # Első cím
+    remaining = list(range(1, len(valid_addresses)))
+    current_coord = coords[0]
+    
+    while remaining:
+        min_distance = float('inf')
+        next_idx = remaining[0]
+        
+        for idx in remaining:
+            distance = haversine_distance(current_coord, coords[idx])
+            if distance < min_distance:
+                min_distance = distance
+                next_idx = idx
+        
+        optimized.append(valid_addresses[next_idx])
+        current_coord = coords[next_idx]
+        remaining.remove(next_idx)
+    
+    logger.info(f"Route optimized: {len(valid_addresses)} addresses")
+    return optimized
 
 def shorten_url(url: str) -> str:
     """
@@ -448,24 +583,37 @@ HTML_TEMPLATE = r"""
     .accept-btn{border:0;border-radius:10px;padding:12px;width:100%;background:#1a73e8;color:#fff;cursor:pointer}
     .muted{color:#666;font-size:12px}
     
-    /* JAVÍTOTT navigációs gombok */
+    /* Navigációs gombok stílusai */
     .nav-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin:8px 0}
     .nav{display:block;text-decoration:none;border:1px solid #1a73e8;border-radius:8px;padding:8px;background:#fff;text-align:center;font-size:11px;color:#1a73e8}
     .nav.apple{border-color:#000;color:#000;background:#f5f5f7}
+    .nav.waze{border-color:#33ccff;color:#33ccff;background:#f0f8ff}
     .nav:hover{opacity:0.8}
     
     .ok{display:none;background:#d4edda;color:#155724;border-radius:8px;padding:10px;margin:8px 0}
     .err{display:none;background:#f8d7da;color:#721c24;border-radius:8px;padding:10px;margin:8px 0}
     
-    /* JAVÍTOTT útvonal gombok */
+    /* Útvonal optimalizáló gombok */
     .routebar{display:none;gap:6px;margin:8px 0;flex-wrap:wrap}
     .routebtn{border:0;border-radius:10px;padding:10px 12px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px}
     .routebtn.apple{background:#000}
+    .routebtn.waze{background:#33ccff}
     .routebtn:hover{opacity:0.9}
   </style>
 </head>
 <body>
   <div class="container">
+
+  <div id="admin-btn" style="display:none; margin-bottom:10px;">
+  <button onclick="openAdmin()" class="accept-btn">⚙️ Admin</button>
+</div>
+<script>
+function openAdmin(){
+  const initData = tg?.initData || '';
+  window.open(`${API}/admin?init_data=${encodeURIComponent(initData)}`, '_blank');
+}
+</script>
+
     <h2>🍕 Futár felület</h2>
 
     <div class="tabs">
@@ -475,10 +623,11 @@ HTML_TEMPLATE = r"""
       <button class="tab" id="tab-dv" onclick="setTab('delivered')">Kiszállított</button>
     </div>
 
-    <!-- JAVÍTOTT útvonal gombok Apple Maps támogatással -->
-    <div class="routebar" id="routebar">
-      <button class="routebtn" onclick="openOptimizedRoute('google')">🗺️ Google Maps - Összes cím</button>
-      <button class="routebtn apple" onclick="openOptimizedRoute('apple')">🍎 Apple Maps - Összes cím</button>
+    <!-- Navigációs gombok - csak Felvett menüben -->
+    <div class="routebar" id="routebar" style="display:none;">
+      <button class="routebtn" onclick="openOptimizedRoute('google')">🗺️ Google Maps - Optimalizált útvonal</button>
+      <button class="routebtn apple" onclick="openOptimizedRoute('apple')">🍎 Apple Maps - Optimalizált útvonal</button>
+      <button class="routebtn waze" onclick="openOptimizedRoute('waze')">🚗 Waze - Optimalizált útvonal</button>
     </div>
 
     <div class="ok" id="ok"></div>
@@ -508,34 +657,49 @@ HTML_TEMPLATE = r"""
     setTimeout(()=>d.style.display='none', 5000); 
   }
 
-  // JAVÍTOTT navigációs linkek - jelenlegi helyről indul
-  function googleMapsLink(addr){
-    const cleanAddr = addr.replace(/^\d{1,2}\.\s+/, ''); // Sorszám eltávolítás
-    // Mobilon az alkalmazást nyitja, asztali böngészőben webet
-    const isMobile = /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    if (isMobile) {
-        return `https://maps.google.com/?q=${encodeURIComponent(cleanAddr)}`;
+  // Navigációs függvények
+  // HELPERS: cím tisztítása / dekódolása, hibabiztos
+    function normalizeAddress(addr){
+      if(!addr && addr !== 0) return '';
+      try {
+    // ha %-kódolt részeket találunk, próbáljuk dekódolni (pl. 'Danko%20Pista' -> 'Danko Pista')
+        if (/%[0-9A-Fa-f]{2}/.test(addr)) {
+            addr = decodeURIComponent(addr);
+        }
+      } catch(e) {
+    // ha a dekódolás hibát dob (hibás %xx), hagyjuk az eredetit
+      }
+  // pluszokból szóköz, többszörös whitespace normalizálás, trim
+      addr = String(addr).replace(/\+/g, ' ').replace(/\s+/g, ' ').trim();
+      return addr;
     }
-    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(cleanAddr)}&travelmode=driving`;
+
+  function googleMapsLink(addr){
+    // eltávolítjuk a sorszám előtagot, majd normalizálunk/dekódolunk
+    const withoutIndex = String(addr).replace(/^\d{1,2}\.\s+/, '');
+    const cleanAddr = normalizeAddress(withoutIndex);
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(cleanAddr)}`;
   }
   
   function appleMapsLink(addr){
-    return `maps://?daddr=${encodeURIComponent(addr)}`;
+    const cleanAddr = addr.replace(/^\d{1,2}\.\s+/, ''); // Sorszám eltávolítás
+    return `https://maps.apple.com/?daddr=${encodeURIComponent(cleanAddr)}&dirflg=d`;
   }
   
   function wazeLink(addr){
-    return `https://waze.com/ul?q=${encodeURIComponent(addr)}&navigate=yes`;
+    const cleanAddr = addr.replace(/^\d{1,2}\.\s+/, ''); // Sorszám eltávolítás
+    return `https://waze.com/ul?q=${encodeURIComponent(cleanAddr)}&navigate=yes`;
   }
 
   function render(order){
-    // JAVÍTOTT navigációs gombok ráccsal
-    const nav = `
+    // Navigációs gombok - csak Felvett menüben
+    const nav = (TAB === 'picked_up') ? `
       <div class="nav-grid">
         <a class="nav" href="${googleMapsLink(order.restaurant_address)}" target="_blank">🗺️ Google</a>
         <a class="nav apple" href="${appleMapsLink(order.restaurant_address)}" target="_blank">🍎 Apple</a>
-        <a class="nav" href="${wazeLink(order.restaurant_address)}" target="_blank">🚗 Waze</a>
+        <a class="nav waze" href="${wazeLink(order.restaurant_address)}" target="_blank">🚗 Waze</a>
       </div>
-    `;
+    ` : '';
     
     const timeBtns = `
       <div class="time-buttons" style="${order.status==='pending'?'':'display:none'}">
@@ -586,6 +750,8 @@ HTML_TEMPLATE = r"""
     document.getElementById('tab-ac').classList.toggle('active', TAB==='accepted');
     document.getElementById('tab-pk').classList.toggle('active', TAB==='picked_up');
     document.getElementById('tab-dv').classList.toggle('active', TAB==='delivered');
+    
+    // Navigációs gombok megjelenítése csak Felvett menüben
     document.getElementById('routebar').style.display = (TAB==='picked_up') ? 'flex' : 'none';
 
     const list = document.getElementById('list');
@@ -695,28 +861,70 @@ HTML_TEMPLATE = r"""
     }
   }
 
-  // JAVÍTOTT útvonal megnyitás
+  // Útvonal optimalizáló függvény
   async function openOptimizedRoute(mapType = 'google'){
     try{
-      const r = await fetch(`${API}/api/opt_route`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
+      // Optimalizált útvonal lekérése
+      const r = await fetch(`${API}/api/optimize_route`, {
+        method:'POST', 
+        headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ 
-          initData: tg?.initData || '', 
-          mapType: mapType 
+          initData: tg?.initData || ''
         })
       });
+      
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
       const j = await r.json();
-      if(!j.ok) throw new Error(j.error || 'Nem sikerült útvonalat készíteni.');
-  
-      // iOS/Telegram WebApp fix mindkét térképhez
-      if (tg?.openLink) {
-        tg.openLink(j.url);
-      } else {
-        window.open(j.url, '_blank');
+      if(!j.ok) throw new Error(j.error||'Hálózati hiba');
+      
+      const addresses = j.addresses || [];
+      if(addresses.length === 0){
+        err('Nincs felvett rendelés az útvonaltervezéshez');
+        return;
       }
+      
+      // Navigációs URL generálása
+      let url;
+      if(mapType === 'apple'){
+        // Apple Maps - minden címet külön daddr paraméterrel
+        const daddr_params = addresses.map(addr => `daddr=${encodeURIComponent(addr)}`).join('&');
+        url = `https://maps.apple.com/?${daddr_params}&dirflg=d`;
+      } else if(mapType === 'waze'){
+        // Waze - csak az első cím (Waze nem támogatja a waypoints-ot)
+        url = `https://waze.com/ul?q=${encodeURIComponent(addresses[0])}&navigate=yes`;
+      } else {
+        // Google Maps - optimalizált útvonal
+        if(addresses.length === 1){
+          url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(normalizeAddress(addresses[0]))}`;
+        } else {
+          const destination = encodeURIComponent(normalizeAddress(addresses[addresses.length-1]));
+          const waypoints = addresses
+            .slice(0, -1)
+            .map(addr => encodeURIComponent(normalizeAddress(addr)))
+            .join('|');
+          url = `https://www.google.com/maps/dir/?api=1&destination=${destination}&waypoints=${waypoints}&travelmode=driving`;
+        }
+      }
+
+      // Link megnyitása
+      if (tg?.openLink) {
+        
+        tg.openLink(url);
+      } else {
+        window.open(url, '_blank');
+      }
+      
+      const mapNames = {
+        'google': 'Google Maps',
+        'apple': 'Apple Maps', 
+        'waze': 'Waze'
+      };
+      
+      ok(`${mapNames[mapType]} megnyitva ${addresses.length} optimalizált címmel`);
+      
     }catch(e){
       console.error('Route error:', e);
-      err(e.message || 'Hiba');
+      err(e.message || 'Hiba az útvonaltervezésnél');
     }
   }
   
@@ -989,81 +1197,46 @@ def api_my_orders():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/api/opt_route", methods=["POST"])
-def api_opt_route_improved():
+@app.route("/api/optimize_route", methods=["POST"])
+def api_optimize_route():
+    """
+    Útvonal optimalizálás felvett rendelésekhez
+    """
     try:
         data = request.json or {}
-        user = validate_telegram_data(data.get("initData",""))
+        user = validate_telegram_data(data.get("initData", ""))
         if not user:
-            return jsonify({"ok": False, "error":"unauthorized"}), 401
-
-        map_type = data.get("mapType", "google")
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
         
+        # Felvett rendelések lekérése
         rows = db.get_partner_addresses(partner_id=user["id"], status="picked_up")
-        addrs = [r["restaurant_address"] for r in rows if r.get("restaurant_address") and r["restaurant_address"].strip()]
+        addresses = [r["restaurant_address"] for r in rows if r.get("restaurant_address") and r["restaurant_address"].strip()]
         
-        if not addrs:
+        if not addresses:
             return jsonify({"ok": False, "error": "no_addresses"})
-
-        def clean_encode_address(addr):
-            return improved_address_cleaner(addr)
         
-        if map_type == "apple":
-            # Apple Maps
-            if len(addrs) == 1:
-                url = f"maps://?daddr={clean_encode_address(addrs[0])}"
-            else:
-                first_addr = clean_encode_address(addrs[0])
-                last_addr = clean_encode_address(addrs[-1])
-                url = f"maps://?saddr={first_addr}&daddr={last_addr}"
-                
-        else:
-            # Google Maps - JAVÍTOTT címkezeléssel
-            if len(addrs) == 1:
-                url = f"https://www.google.com/maps/dir/?api=1&destination={clean_encode_address(addrs[0])}&travelmode=driving"
-                
-            elif len(addrs) == 2:
-                # Két cím: első->második
-                dest = clean_encode_address(addrs[1])
-                waypoint = clean_encode_address(addrs[0])
-                url = f"https://www.google.com/maps/dir/?api=1&destination={dest}&waypoints={waypoint}&travelmode=driving"
-                
-            else:
-                # Több cím (3+)
-                destination = clean_encode_address(addrs[-1])
-                waypoints = [clean_encode_address(addr) for addr in addrs[:-1]]
-                
-                # Google Maps waypoints limit (23)
-                if len(waypoints) > 23:
-                    waypoints = waypoints[:23]
-                    logger.warning(f"Waypoints truncated: {len(addrs)} -> 24 (23 waypoints + destination)")
-                
-                waypoints_str = "|".join(waypoints)
-                url = f"https://www.google.com/maps/dir/?api=1&destination={destination}&waypoints={waypoints_str}&travelmode=driving"
-                # Ha a link nagyon hosszú vagy sok cím van, akkor rövidítünk
-            if len(url) > 1800 or len(addrs) >= 4:
-                short_url = shorten_url(url)
-                final_url = short_url
-            else:
-                final_url = url
+        # Útvonal optimalizálás
+        optimized_addresses = optimize_route(addresses)
 
-            return jsonify({
-                "ok": True,
-                "url": final_url,
-                "count": len(addrs),
-                "mapType": map_type,
-                "addresses_original": addrs,
-                "addresses_cleaned": [clean_encode_address(addr) for addr in addrs]
-            })
-
+        return jsonify({
+            "ok": True,
+            "addresses": optimized_addresses,
+            "count": len(optimized_addresses)
+        })
         
     except Exception as e:
-        logger.error(f"api_opt_route error: {e}")
-        return jsonify({"ok": False, "error": f"internal_server_error: {str(e)}"}), 500
+        logger.error(f"api_optimize_route error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
     
 @app.route("/admin")
 def admin_page():
+    init_data = request.args.get('tgWebAppData', '')
+    user = validate_telegram_data(init_data)
+    
+    if not user or user.get("id") not in ADMIN_USER_IDS:
+        return "🚫 Hozzáférés megtagadva", 403
+    
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.row_factory = sqlite3.Row
