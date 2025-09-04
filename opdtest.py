@@ -605,13 +605,31 @@ HTML_TEMPLATE = r"""
   <div class="container">
 
   <div id="admin-btn" style="display:none; margin-bottom:10px;">
-  <button onclick="openAdmin()" class="accept-btn">⚙️ Admin</button>
-</div>
+    <button onclick="openAdmin()" class="accept-btn">⚙️ Admin</button>
+  </div>
+
 <script>
-function openAdmin(){
-  const initData = tg?.initData || '';
-  window.open(`${API}/admin?init_data=${encodeURIComponent(initData)}`, '_blank');
-}
+  function openAdmin(){
+    const initData = window.Telegram?.WebApp?.initData || '';
+    window.open(`${window.location.origin}/admin?init_data=${encodeURIComponent(initData)}`, '_blank');
+  }
+
+  async function checkAdmin(){
+    try{
+      const r = await fetch(`${window.location.origin}/api/is_admin`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ initData: window.Telegram?.WebApp?.initData || '' })
+      });
+      const j = await r.json();
+      if(j.ok && j.admin){
+        document.getElementById('admin-btn').style.display = 'block';
+      }
+    }catch(e){
+      console.error('Admin check error:', e);
+    }
+  }
+  checkAdmin();
 </script>
 
     <h2>🍕 Futár felület</h2>
@@ -1231,7 +1249,7 @@ def api_optimize_route():
     
 @app.route("/admin")
 def admin_page():
-    init_data = request.args.get('tgWebAppData', '')
+    init_data = request.args.get('init_data', '')
     user = validate_telegram_data(init_data)
     
     if not user or user.get("id") not in ADMIN_USER_IDS:
@@ -1295,6 +1313,21 @@ def admin_page():
     except Exception as e:
         logger.error(f"admin_page error: {e}")
         return "admin error", 500
+
+@app.route("/api/is_admin", methods=["POST"])
+def api_is_admin():
+    try:
+        data = request.json or {}
+        user = validate_telegram_data(data.get("initData", ""))
+        if not user:
+            return jsonify({"ok": False, "admin": False}), 401
+        return jsonify({
+            "ok": True,
+            "admin": user.get("id") in ADMIN_USER_IDS
+        })
+    except Exception as e:
+        logger.error(f"api_is_admin error: {e}")
+        return jsonify({"ok": False, "admin": False}), 500
 
 
 
