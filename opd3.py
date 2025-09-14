@@ -29,7 +29,7 @@ from collections import defaultdict
 # Telegram imports are optional if you run bot; keep them to preserve original behavior
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+    from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
     TELEGRAM_AVAILABLE = True
 except Exception:
     TELEGRAM_AVAILABLE = False
@@ -432,11 +432,11 @@ def notify_all_couriers_order(order_id: int, text: str):
         logger.error(f"notify_all_couriers_order error: {e}")
 
 def get_orders_by_courier(self, courier_id, status_filter="accepted"):
-    with sqlite3.connect(self.db_path) as conn:
+    with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM orders WHERE partner_id=? AND status=?",
+            "SELECT * FROM orders WHERE delivery_partner_id = ? AND status = ?",
             (courier_id, status_filter),
         )
         return [dict(row) for row in cur.fetchall()]
@@ -459,6 +459,8 @@ class RestaurantBot:
         app.add_handler(CommandHandler("myorders", self.my_orders))
         app.add_handler(CommandHandler("route_all", self.route_all))
         app.add_handler(CommandHandler("route", self.route_single))
+        app.add_handler(CallbackQueryHandler(self.handle_callback_query))
+
         
         # Callback query handler hozzáadása
         from telegram.ext import CallbackQueryHandler
@@ -721,22 +723,25 @@ class RestaurantBot:
             return
 
         for order in orders:
-            text = (
-                f"🆔 Rendelés #{order['id']}\n"
-                f"📍 {order['restaurant_address']}\n"
-                f"📝 {order['order_details'] or '—'}\n"
-                f"Státusz: {order['status']}"
-            )
+            text = (f"🆔 Rendelés #{order['id']}\n"
+                    f"📍 {order['restaurant_address']}\n"
+                    f"📝 {order['order_details'] or '—'}\n"
+                    f"Státusz: {order['status']}")
             keyboard = [
-                [InlineKeyboardButton("📍 Útvonal ehhez", url=f"https://www.google.com/maps/dir/?api=1&destination={order['restaurant_address']}")]
+                [
+                    InlineKeyboardButton("✅ Kiszállítva", callback_data=f"delivered_{order['id']}"),
+                    InlineKeyboardButton("📍 Navigáció", url=f"https://www.google.com/maps/dir/?api=1&destination={urllib.parse.quote(order['restaurant_address'])}")
+                ]
             ]
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # plusz egy összesítő gomb
+        # Összes rendeléshez útvonal gomb
         all_keyboard = [
-            [InlineKeyboardButton("📍 Útvonal az összeshez", callback_data="route_all")]
+            [
+                InlineKeyboardButton("🗺 Útvonal az összeshez", callback_data="route_all")
+            ]
         ]
-        await update.message.reply_text("Összes rendeléshez:", reply_markup=InlineKeyboardMarkup(all_keyboard))
+        await update.message.reply_text("Összes rendeléshez útvonal:", reply_markup=InlineKeyboardMarkup(all_keyboard))
 
 
     async def route_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -747,51 +752,36 @@ class RestaurantBot:
             return
 
         addresses = [o["restaurant_address"] for o in orders]
-        waypoints = "|".join(addresses[:-1])
-        destination = addresses[-1]
-        maps_url = f"https://www.google.com/maps/dir/?api=1&origin=Jelenlegi+hely&destination={destination}&waypoints={waypoints}"
+        # Url-kódolás miatt
+        encoded = [urllib.parse.quote(addr) for addr in addresses]
+        if len(encoded) == 1:
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded[0]}"
+        else:
+            waypoints = "|".join(encoded[:-1])
+            destination = encoded[-1]
+            maps_url = f"https://www.google.com/maps/dir/?api=1&destination={destination}&waypoints={waypoints}&travelmode=driving"
+            
         await update.message.reply_text(f"🗺 Útvonal minden rendeléshez:\n{maps_url}")
 
 
     async def route_single(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if len(context.args) < 1:
-            await update.message.reply_text("Használat: /route <order_id>")
+        if not context.args or len(context.args) < 1:
+            await update.message.reply_text("Használat: /route <rendeles_id>")
             return
-        order_id = context.args[0]
-        order = db.get_order(order_id)
+        try:
+            order_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Az ID-nak számnak kell lennie.")
+            return
+
+        order = db.get_order_by_id(order_id)
         if not order:
             await update.message.reply_text("❌ Nincs ilyen rendelés.")
             return
 
-        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={order['restaurant_address']}"
+        addr = order["restaurant_address"]
+        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={urllib.parse.quote(addr)}"
         await update.message.reply_text(f"🗺 Útvonal a rendeléshez:\n{maps_url}")
-
-    async def my_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        orders = db.get_orders_by_courier(user_id, status_filter="accepted")
-        if not orders:
-            await update.message.reply_text("📭 Nincsenek aktív rendeléseid.")
-            return
-
-        for order in orders:
-            text = (
-                f"🆔 Rendelés #{order['id']}\n"
-                f"📍 {order['restaurant_address']}\n"
-                f"📝 {order['order_details'] or '—'}"
-            )
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Kiszállítva", callback_data=f"delivered:{order['id']}"),
-                    InlineKeyboardButton("📍 Navigáció", url=f"https://www.google.com/maps/dir/?api=1&destination={order['restaurant_address']}")
-                ]
-            ]
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-        # végén egy összesítő gomb
-        all_keyboard = [
-            [InlineKeyboardButton("🗺 Útvonal az összeshez", callback_data="route_all")]
-        ]
-        await update.message.reply_text("Összes rendeléshez útvonal:", reply_markup=InlineKeyboardMarkup(all_keyboard))
 
 # ---------------- Flask WebApp ----------------
 app = Flask(__name__); CORS(app)
