@@ -29,14 +29,15 @@ from collections import defaultdict
 # Telegram imports are optional if you run bot; keep them to preserve original behavior
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    import urllib.parse
     from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
     TELEGRAM_AVAILABLE = True
 except Exception:
     TELEGRAM_AVAILABLE = False
 
 # =============== CONFIG ===============
-BOT_TOKEN = "7741178469:AAEXmDVBCDCp6wY0AzPzxpuEzNRcKId86_o"
-WEBAPP_URL = "https://dfc0c31345ea.ngrok-free.app"
+BOT_TOKEN = "7741178469:AAH9pvClqBOa31Yenq_0Y9dxtrug-ZMmDk4"
+WEBAPP_URL = "https://94377687755d.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
 ADMIN_USER_IDS = [7553912440]  # adjust as needed
 
@@ -301,6 +302,7 @@ def coords_to_waze_url(coords_with_addr: List[Tuple[str, float, float]]) -> str:
 class DatabaseManager:
     def __init__(self) -> None:
         self.init_db()
+        self.db_path = DB_NAME
     def init_db(self) -> None:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
@@ -397,7 +399,6 @@ class DatabaseManager:
         rows = [dict(r) for r in cur.fetchall()]; conn.close(); return rows
 
 db = DatabaseManager()
-db = DatabaseManager()
 
 def notify_all_couriers_order(order_id: int, text: str):
     """
@@ -436,7 +437,7 @@ def get_orders_by_courier(self, courier_id, status_filter="accepted"):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM orders WHERE delivery_partner_id = ? AND status = ?",
+            "SELECT * FROM orders WHERE partner_id = ? AND status = ?",
             (courier_id, status_filter),
         )
         return [dict(row) for row in cur.fetchall()]
@@ -460,15 +461,7 @@ class RestaurantBot:
         app.add_handler(CommandHandler("route_all", self.route_all))
         app.add_handler(CommandHandler("route", self.route_single))
         app.add_handler(CallbackQueryHandler(self.handle_callback_query))
-
-        
-        # Callback query handler hozzáadása
-        from telegram.ext import CallbackQueryHandler
-        app.add_handler(CallbackQueryHandler(self.handle_callback_query))
     
-        if app.job_queue:
-            app.job_queue.run_repeating(self.process_notifications, interval=3)
-
         if app.job_queue:
             app.job_queue.run_repeating(self.process_notifications, interval=3)
 
@@ -679,6 +672,9 @@ class RestaurantBot:
                     f"🆔 #{order_id}\n"
                     f"Köszönjük a munkát!"
                 )
+
+            elif data == "route_all":
+                await self.route_all(update, context)
             
             elif data.startswith("navigate_"):
                 order_id = int(data.split("_")[1])
@@ -737,10 +733,9 @@ class RestaurantBot:
 
         # Összes rendeléshez útvonal gomb
         all_keyboard = [
-            [
-                InlineKeyboardButton("🗺 Útvonal az összeshez", callback_data="route_all")
-            ]
+            [InlineKeyboardButton("🗺 Útvonal az összeshez", callback_data="route_all")
         ]
+    ]
         await update.message.reply_text("Összes rendeléshez útvonal:", reply_markup=InlineKeyboardMarkup(all_keyboard))
 
 
@@ -1118,21 +1113,6 @@ async function wazeLink(orderId){
         <a class="nav waze" href="#" onclick="openWaze(${order.id})" target="_blank">🚗 Waze</a>
       </div>
     ` : '';
-
-    async function openGoogleMaps(orderId) {
-      const link = await googleMapsLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
-    }
-
-    async function openAppleMaps(orderId) {
-      const link = await appleMapsLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
-    }
-
-    async function openWaze(orderId) {
-      const link = await wazeLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
-    }
     
     const timeBtns = `
       <div class="time-buttons" style="${order.status==='pending'?'':'display:none'}">
@@ -1163,6 +1143,21 @@ async function wazeLink(orderId){
         ${showBtn ? `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}</button>` : ''}
       </div>
     `;
+  }
+
+  async function openGoogleMaps(orderId) {
+      const link = await googleMapsLink(orderId);
+      if(link !== '#') window.open(link, '_blank');
+  }
+
+  async function openAppleMaps(orderId) {
+      const link = await appleMapsLink(orderId);
+      if(link !== '#') window.open(link, '_blank');
+  }
+
+  async function openWaze(orderId) {
+      const link = await wazeLink(orderId);
+      if(link !== '#') window.open(link, '_blank');
   }
 
   function wireTimeButtons(){
