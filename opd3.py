@@ -36,8 +36,8 @@ except Exception:
     TELEGRAM_AVAILABLE = False
 
 # =============== CONFIG ===============
-BOT_TOKEN = "your_telegram_bot_toker"
-WEBAPP_URL = "your_webapp_url"
+BOT_TOKEN = "7741178469:AAH9pvClqBOa31Yenq_0Y9dxtrug-ZMmDk4"
+WEBAPP_URL = "https://94377687755d.ngrok-free.app"
 DB_NAME = "restaurant_orders.db"
 ADMIN_USER_IDS = [7553912440]  # adjust as needed
 
@@ -398,6 +398,29 @@ class DatabaseManager:
         cur.execute("SELECT user_id, username, first_name, last_name FROM couriers")
         rows = [dict(r) for r in cur.fetchall()]; conn.close(); return rows
 
+    def get_orders_by_courier(self, courier_id, status_filter=None):
+        conn = sqlite3.connect(DB_NAME); cur = conn.cursor()
+        cur = conn.cursor()
+
+        if status_filter:
+            cur.execute("""
+                SELECT id, restaurant, address, phone, status, created_at
+                FROM orders
+                WHERE courier_id = ? AND status = ?
+                ORDER BY created_at DESC
+            """, (courier_id, status_filter))
+        else:
+            cur.execute("""
+                SELECT id, restaurant, address, phone, status, created_at
+                FROM orders
+                WHERE courier_id = ?
+                ORDER BY created_at DESC
+            """, (courier_id,))
+
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+
 db = DatabaseManager()
 
 def notify_all_couriers_order(order_id: int, text: str):
@@ -431,16 +454,7 @@ def notify_all_couriers_order(order_id: int, text: str):
                 logger.info(f"Queued interactive notification for courier {uid}")
     except Exception as e:
         logger.error(f"notify_all_couriers_order error: {e}")
-
-def get_orders_by_courier(self, courier_id, status_filter="accepted"):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM orders WHERE partner_id = ? AND status = ?",
-            (courier_id, status_filter),
-        )
-        return [dict(row) for row in cur.fetchall()]
+1
         
 # ---------------- Telegram Bot (kept intact) ----------------
 class RestaurantBot:
@@ -614,7 +628,6 @@ class RestaurantBot:
                 # Új gombok elfogadás után
                 keyboard = [
                     [InlineKeyboardButton("✅ Felvettem", callback_data=f"pickup_{order_id}")],
-                    [InlineKeyboardButton("🗺️ Navigáció", callback_data=f"navigate_{order_id}")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -648,7 +661,6 @@ class RestaurantBot:
                 # Új gombok felvétel után
                 keyboard = [
                     [InlineKeyboardButton("✅ Kiszállítva", callback_data=f"delivered_{order_id}")],
-                    [InlineKeyboardButton("🗺️ Navigáció", callback_data=f"navigate_{order_id}")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -661,6 +673,19 @@ class RestaurantBot:
                     f"🆔 #{order_id}",
                     reply_markup=reply_markup
                 )
+                try:
+                    partner_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or str(user.id)
+                    partner_username = user.username
+                    partner_contact = f"@{partner_username}" if partner_username else partner_name
+        
+                    group_text = (f"📦 **RENDELÉS FELVÉVE!**\n\n"
+                                  f"👤 **Futár:** {partner_name}\n"
+                                  f"📱 **Kontakt:** {partner_contact}\n"
+                                  f"📋 **Rendelés ID:** #{order_id}\n")
+                    notification_queue.put({"chat_id": order["group_id"], "text": group_text})
+                except Exception as e:
+                    logger.error(f"Group notify error (pickup): {e}")
+
             
             elif data.startswith("delivered_"):
                 order_id = int(data.split("_")[1])
@@ -672,37 +697,20 @@ class RestaurantBot:
                     f"🆔 #{order_id}\n"
                     f"Köszönjük a munkát!"
                 )
+                try:
+                    order = db.get_order_by_id(order_id)
+                    partner_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or str(user.id)
+                    partner_username = user.username
+                    partner_contact = f"@{partner_username}" if partner_username else partner_name
+        
+                    group_text = (f"✅ **RENDELÉS KISZÁLLÍTVA!**\n\n"
+                                  f"👤 **Futár:** {partner_name}\n"
+                                  f"📱 **Kontakt:** {partner_contact}\n"
+                                  f"📋 **Rendelés ID:** #{order_id}\n")
+                    notification_queue.put({"chat_id": order["group_id"], "text": group_text})
+                except Exception as e:
+                    logger.error(f"Group notify error (delivered): {e}")
 
-            elif data == "route_all":
-                await self.route_all(update, context)
-            
-            elif data.startswith("navigate_"):
-                order_id = int(data.split("_")[1])
-                order = db.get_order_by_id(order_id)
-            
-                if order:
-                    coord = geocode_address(order["restaurant_address"])
-                    if coord:
-                        lat, lon = coord
-                        google_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}&dir_action=navigate"
-                    
-                        # Navigációs gombok
-                        nav_keyboard = [
-                            [InlineKeyboardButton("🗺️ Google Maps", url=google_url)],
-                            [InlineKeyboardButton("🍎 Apple Maps", url=f"https://maps.apple.com/?daddr={lat},{lon}&dirflg=d")],
-                            [InlineKeyboardButton("🚗 Waze", url=f"https://waze.com/ul?ll={lat},{lon}&navigate=yes")],
-                            [InlineKeyboardButton("⬅️ Vissza", callback_data=f"back_{order_id}")]
-                        ]
-                        nav_markup = InlineKeyboardMarkup(nav_keyboard)
-                    
-                        await query.edit_message_text(
-                            f"🗺️ Navigáció indítása:\n\n"
-                            f"📍 {order['restaurant_address']}\n"
-                            f"🆔 #{order_id}",
-                            reply_markup=nav_markup
-                        )
-                    else:
-                        await query.answer("Hiba a geokódolásban", show_alert=True)
             
             elif data.startswith("reject_"):
                 await query.edit_message_text("❌ Rendelés elutasítva")
@@ -1108,7 +1116,7 @@ async function wazeLink(orderId){
     // Navigációs gombok - csak Felvett menüben
     const nav = (TAB === 'picked_up') ? `
       <div class="nav-grid">
-        <a class="nav" href="#" onclick="openGoogleMaps(${order.id})" target="_blank">🗺️ Google</a>
+        <a class="nav" href="javascript:void(0)" onclick="openGoogleMaps(${order.id})">🗺️ Google</a>
         <a class="nav apple" href="#" onclick="openAppleMaps(${order.id})" target="_blank">🍎 Apple</a>
         <a class="nav waze" href="#" onclick="openWaze(${order.id})" target="_blank">🚗 Waze</a>
       </div>
@@ -1146,18 +1154,24 @@ async function wazeLink(orderId){
   }
 
   async function openGoogleMaps(orderId) {
-      const link = await googleMapsLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
+    const link = await googleMapsLink(orderId);
+    if (link && link !== '#') {
+        window.location.href = link;  // közvetlen átirányítás
+    }
   }
 
   async function openAppleMaps(orderId) {
       const link = await appleMapsLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
+      if (link && link !== '#') {
+          window.location.href = link;
+      }
   }
 
   async function openWaze(orderId) {
       const link = await wazeLink(orderId);
-      if(link !== '#') window.open(link, '_blank');
+      if (link && link !== '#') {
+          window.location.href = link;
+      }
   }
 
   function wireTimeButtons(){
@@ -2342,4 +2356,3 @@ if __name__ == "__main__":
         RestaurantBot().run()
     else:
         logger.info("Flask started in this environment; Telegram bot not available.")
-
