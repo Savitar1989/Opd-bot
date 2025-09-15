@@ -35,8 +35,8 @@ except Exception:
     TELEGRAM_AVAILABLE = False
 
 # =============== CONFIG ===============
-BOT_TOKEN = "7741178469:AAH9pvClqBOa31Yenq_0Y9dxtrug-ZMmDk4"
-WEBAPP_URL = "https://a842b4247e75.ngrok-free.app"
+BOT_TOKEN = "your_telegram_bot_token"
+WEBAPP_URL = "your_webapp_url"
 DB_NAME = "restaurant_orders.db"
 ADMIN_USER_IDS = [7553912440]  # adjust as needed
 
