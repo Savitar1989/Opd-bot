@@ -481,9 +481,7 @@ class RestaurantBot:
                 [
                     InlineKeyboardButton("✅ Kiszállítva", callback_data=f"delivered_{order['id']}")],
                 ]
-            [
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        ]
     
 # ---------------- Flask WebApp ----------------
 app = Flask(__name__); CORS(app)
@@ -687,7 +685,6 @@ if(tg && tg.initData){
         ${order.phone_number ? `<div>📞 <b>Telefon:</b> ${order.phone_number}</div>` : ''}
         ${order.order_details ? `<div>📝 <b>Megjegyzés:</b> ${order.order_details}</div>` : ''}
         <div class="muted">ID: #${order.id} • ${order.created_at}</div>
-        ${nav}
         ${timeBtns}
         ${showBtn ? `<button class="accept-btn" id="btn-${order.id}" onclick="doAction(${order.id}, '${order.status}')">${btnLabel}</button>` : ''}
       </div>
@@ -712,7 +709,42 @@ if(tg && tg.initData){
     document.getElementById('tab-ac').classList.toggle('active', TAB==='accepted');
     document.getElementById('tab-pk').classList.toggle('active', TAB==='picked_up');
     document.getElementById('tab-dv').classList.toggle('active', TAB==='delivered');
-    
+
+    const list = document.getElementById('list');
+    list.innerHTML = 'Betöltés…';
+
+    let data = [];
+    try {
+        if(TAB === 'available'){
+            const r = await fetch(`${API}/api/orders_by_status?status=pending`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+            data = await r.json();
+        } else {
+            const r = await fetch(`${API}/api/my_orders`, {
+                method:'POST', 
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ initData: tg?.initData || '', status: TAB })
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+            const j = await r.json();
+            if(!j.ok) throw new Error(j.error||'Hálózati hiba');
+            data = j.orders || [];
+        }
+        
+        if(!data.length){ 
+            list.innerHTML = '<div class="muted">Nincs rendelés.</div>'; 
+            return; 
+        }
+        
+        list.innerHTML = data.map(render).join('');
+        wireTimeButtons();
+        
+    } catch(e) {
+        console.error('Load error:', e);
+        err(e.message||'Hiba a betöltésnél');
+        list.innerHTML = '<div class="muted">Hiba történt a betöltés során.</div>';
+    }
+}
 
   async function doAction(orderId, status){
     const btn = document.getElementById(`btn-${orderId}`);
@@ -830,26 +862,31 @@ if(tg && tg.initData){
     }
   }
 
-  function backToWeeks(){
-    document.getElementById('weeks-list').style.display = 'block';
-    document.getElementById('week-orders').style.display = 'none';
-  }
-  
   function setTab(t){
     TAB = t;
     
     // History section kezelése
     if(t === 'history'){
-      document.getElementById('list').style.display = 'none';
-      document.getElementById('history-section').style.display = 'block';
-      document.getElementById('routebar').style.display = 'none';
-      loadHistory();
+        document.getElementById('list').style.display = 'none';
+        document.getElementById('history-section').style.display = 'block';
+        loadHistory();
     } else {
-      document.getElementById('list').style.display = 'block';
-      document.getElementById('history-section').style.display = 'none';
-      load();
+        document.getElementById('list').style.display = 'block';
+        document.getElementById('history-section').style.display = 'none';
+        load();
     }
-  }
+    
+    // Tab gombok aktív állapotának beállítása
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.classList.remove('active');
+    });
+    document.getElementById(`tab-${t}`).classList.add('active');
+}
+
+function backToWeeks(){
+    document.getElementById('weeks-list').style.display = 'block';
+    document.getElementById('week-orders').style.display = 'none';
+}
 
   // Kezdeti betöltés és automatikus frissítés
   load();
